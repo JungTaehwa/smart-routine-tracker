@@ -87,7 +87,12 @@ HTML_LAYOUT = """
 <!DOCTYPE html>
 <html lang="ko">
 <head>
-  <meta charset="UTF-8">
+  <link rel="manifest" href="/manifest.json">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#121620">
+<meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <title>스마트 계획 & 실행 트래커</title>
   <script src="https://cdn.tailwindcss.com"></script>
@@ -487,10 +492,33 @@ HTML_LAYOUT = """
 </html>
 """
 
+
 @app.get("/", response_class=HTMLResponse)
 def home():
     return HTMLResponse(content=HTML_LAYOUT)
 
+# ▼ 바로 여기에 붙여넣으시면 됩니다 ▼
+@app.get("/manifest.json")
+def get_manifest():
+    return {
+        "name": "스마트 루틴 & 계획 트래커",
+        "short_name": "루틴트래커",
+        "start_url": "/",
+        "display": "standalone",
+        "background_color": "#121620",
+        "theme_color": "#121620",
+        "icons": [
+            {
+                "src": "https://cdn-icons-png.flaticon.com/512/906/906334.png",
+                "sizes": "512x512",
+                "type": "image/png"
+            }
+        ]
+    }
+
+# ----------------- 인증 API -----------------
+@app.post("/api/signup")
+...
 # ----------------- 인증 API -----------------
 @app.post("/api/signup")
 def signup(data: UserAuth):
