@@ -1,5 +1,6 @@
 import os
 import sqlite3
+import hashlib
 from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
@@ -8,13 +9,13 @@ from google import genai
 
 app = FastAPI()
 
-# 한국 표준시 (KST = UTC+9) 설정
+# 한국 표준시 (KST = UTC+9)
 KST = timezone(timedelta(hours=9))
 
 def get_now_kst():
     return datetime.now(KST)
 
-# Gemini API 클라이언트 초기화
+# Gemini API 클라이언트 설정 (Render 환경변수 GEMINI_API_KEY)
 GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
 ai_client = genai.Client(api_key=GEMINI_KEY) if GEMINI_KEY else None
 
@@ -23,10 +24,19 @@ DB_PATH = "routines.db"
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    # 계획 & 실행 테이블
+    # 1. 회원 테이블
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE,
+            password TEXT
+        )
+    """)
+    # 2. 계획 및 실행 기록 테이블
     cur.execute("""
         CREATE TABLE IF NOT EXISTS plans (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT,
             category TEXT,
             title TEXT,
             is_done INTEGER DEFAULT 0,
@@ -34,23 +44,29 @@ def init_db():
             plan_date TEXT
         )
     """)
-    # 카테고리 테이블
+    # 3. 카테고리 테이블
     cur.execute("""
         CREATE TABLE IF NOT EXISTS categories (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE
+            username TEXT,
+            name TEXT
         )
     """)
-    # 기본 카테고리 초기 데이터
-    default_cats = ["아침", "업무/학습", "운동", "개인", "저녁"]
-    for cat in default_cats:
-        cur.execute("INSERT OR IGNORE INTO categories (name) VALUES (?)", (cat,))
     conn.commit()
     conn.close()
 
 init_db()
 
+def hash_pw(pw: str) -> str:
+    return hashlib.sha256(pw.encode()).hexdigest()
+
+# Pydantic 모델
+class UserAuth(BaseModel):
+    username: str
+    password: str
+
 class PlanCreate(BaseModel):
+    username: str
     category: str
     title: str
     plan_date: str
@@ -59,11 +75,14 @@ class PlanToggle(BaseModel):
     id: int
 
 class CategoryCreate(BaseModel):
+    username: str
     name: str
 
 class AIRequest(BaseModel):
+    username: str
     plan_date: str
 
+# 프론트엔드 반응형 통합 UI (투두메이트 다크 테마 + 모바일 최적화)
 HTML_LAYOUT = """
 <!DOCTYPE html>
 <html lang="ko">
@@ -74,20 +93,24 @@ HTML_LAYOUT = """
   <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-[#0b0f17] text-white flex justify-center min-h-screen font-sans">
-  <div class="w-full max-w-md bg-[#121620] border-x border-[#1e2330] flex flex-col min-h-screen shadow-2xl">
+  <div class="w-full max-w-md bg-[#121620] border-x border-[#1e2330] flex flex-col min-h-screen shadow-2xl relative">
     
     <!-- 상단 헤더 -->
     <header class="p-4 border-b border-[#1e2330] flex justify-between items-center bg-[#161b26]">
       <div>
-        <h1 class="text-lg font-bold tracking-tight text-teal-400">⚡ 스마트 계획 & 실행</h1>
+        <h1 class="text-base font-bold tracking-tight text-teal-400">⚡ 스마트 계획 & 실행</h1>
         <p class="text-xs text-slate-400" id="header-week-title">2026년 10월 2주차</p>
       </div>
-      <button onclick="requestAIFeedback()" class="bg-indigo-600 hover:bg-indigo-500 text-xs px-3 py-1.5 rounded-full font-semibold transition shadow-md">
-        ✨ AI 피드백
-      </button>
+      <div class="flex items-center space-x-2">
+        <span id="user-display" class="text-xs font-semibold text-teal-300"></span>
+        <button onclick="logout()" class="text-[11px] text-slate-400 hover:text-rose-400 transition">로그아웃</button>
+        <button onclick="requestAIFeedback()" class="bg-indigo-600 hover:bg-indigo-500 text-xs px-2.5 py-1.5 rounded-full font-semibold transition shadow-md">
+          ✨ AI
+        </button>
+      </div>
     </header>
 
-    <!-- 탭 네비게이션 (계획 / 타임라인 / 패치노트) -->
+    <!-- 상단 네비게이션 탭 -->
     <nav class="flex border-b border-[#1e2330] bg-[#141924] text-xs font-semibold">
       <button id="tab-plan-btn" onclick="switchTab('plan')" class="flex-1 py-3 text-center border-b-2 border-teal-400 text-teal-300">
         📋 계획 & 실행
@@ -112,19 +135,18 @@ HTML_LAYOUT = """
         <div class="grid grid-cols-7 gap-1 text-center" id="week-days-container"></div>
       </div>
 
-      <!-- AI 피드백 카드 -->
-      <div id="ai-card" class="mx-3 mt-3 p-3.5 rounded-xl bg-gradient-to-r from-indigo-950/50 to-slate-900 border border-indigo-500/30 hidden">
+      <!-- AI 코칭 피드백 카드 -->
+      <div id="ai-card" class="mx-3 mt-3 p-3.5 rounded-xl bg-gradient-to-r from-indigo-950/60 to-slate-900 border border-indigo-500/30 hidden">
         <div class="flex items-center space-x-2 text-indigo-400 font-bold text-xs mb-1.5">
-          <span>🤖</span> <span>Gemini 실행 피드백</span>
+          <span>🤖</span> <span>Gemini 계획 & 실행 피드백</span>
         </div>
         <p id="ai-text" class="text-xs leading-relaxed text-slate-300 whitespace-pre-line"></p>
       </div>
 
-      <!-- 카테고리 선택 및 추가 바 -->
+      <!-- 카테고리 태그 및 입력 영역 -->
       <div class="p-3">
         <div class="flex items-center space-x-1.5 overflow-x-auto pb-2 scrollbar-none" id="category-bar"></div>
 
-        <!-- 입력 폼 -->
         <form onsubmit="addPlan(event)" class="flex gap-2 mt-2">
           <input type="text" id="plan-input" placeholder="실행할 계획 입력..." required
             class="flex-1 bg-[#1a202e] border border-[#2d354a] rounded-xl px-3.5 py-2.5 text-sm focus:outline-none focus:border-teal-400 text-white placeholder-slate-500">
@@ -132,7 +154,7 @@ HTML_LAYOUT = """
         </form>
       </div>
 
-      <!-- 계획 목록 -->
+      <!-- 계획 리스트 목록 -->
       <div class="flex-1 px-3 pb-4 space-y-2 overflow-y-auto" id="plan-list"></div>
     </div>
 
@@ -142,46 +164,61 @@ HTML_LAYOUT = """
         <h2 class="text-sm font-bold text-teal-300">⏱️ 오늘 실행 타임라인</h2>
         <span class="text-xs text-slate-400 font-mono" id="timeline-date-label"></span>
       </div>
-      <div class="flex-1 overflow-y-auto space-y-3" id="timeline-list"></div>
+      <div class="flex-1 overflow-y-auto space-y-2.5" id="timeline-list"></div>
     </div>
 
     <!-- [탭 3] 패치노트 뷰 -->
-    <div id="tab-patch" class="flex-1 flex flex-col p-4 overflow-y-auto hidden space-y-4">
+    <div id="tab-patch" class="flex-1 flex flex-col p-4 overflow-y-auto hidden space-y-3">
       <div class="border-b border-slate-800 pb-2">
         <h2 class="text-sm font-bold text-teal-400">🚀 패치노트</h2>
-        <p class="text-xs text-slate-400">프로그램 개선 및 업데이트 히스토리</p>
+        <p class="text-xs text-slate-400">시스템 업데이트 히스토리</p>
       </div>
 
-      <div class="bg-[#171c28] p-3.5 rounded-xl border border-slate-800">
-        <div class="flex items-center justify-between mb-2">
-          <span class="text-xs font-bold text-teal-300 bg-teal-950/60 px-2 py-0.5 rounded border border-teal-800/40">v1.1.0</span>
+      <div class="bg-[#171c28] p-3 rounded-xl border border-slate-800">
+        <div class="flex items-center justify-between mb-1.5">
+          <span class="text-xs font-bold text-teal-300 bg-teal-950 px-2 py-0.5 rounded border border-teal-800">v1.2.0</span>
           <span class="text-[11px] text-slate-500">2026-10-07</span>
         </div>
-        <ul class="text-xs text-slate-300 space-y-1.5 list-disc list-inside">
-          <li><strong>한국 표준시(KST) 적용</strong>: 완료 시각 9시간 오차 전면 수정</li>
-          <li><strong>주차별/일자별 네비게이션</strong>: 10월 2주차 등 주간 선택 바 탑재</li>
-          <li><strong>텍스트 시인성 개선</strong>: 완료 시 취소선 및 흐림 제거</li>
-          <li><strong>실행 타임라인 탭 신설</strong>: 하루 실행 기록 시간순 조회</li>
-          <li><strong>카테고리 커스텀 기능</strong>: 계획 카테고리 실시간 추가 지원</li>
+        <ul class="text-xs text-slate-300 space-y-1 list-disc list-inside">
+          <li><strong>ID/PW 계정 동기화 탑재</strong>: 다중 기기(PC, 모바일) 실시간 데이터 동기화 지원</li>
+          <li><strong>비밀번호 암호화 저장</strong>: SHA-256 해시 처리 적용</li>
         </ul>
       </div>
 
-      <div class="bg-[#171c28] p-3.5 rounded-xl border border-slate-800">
-        <div class="flex items-center justify-between mb-2">
-          <span class="text-xs font-bold text-slate-300 bg-slate-800 px-2 py-0.5 rounded">v1.0.0</span>
+      <div class="bg-[#171c28] p-3 rounded-xl border border-slate-800">
+        <div class="flex items-center justify-between mb-1.5">
+          <span class="text-xs font-bold text-slate-300 bg-slate-800 px-2 py-0.5 rounded">v1.1.0</span>
           <span class="text-[11px] text-slate-500">2026-10-07</span>
         </div>
         <ul class="text-xs text-slate-400 space-y-1 list-disc list-inside">
-          <li>기본 루틴 등록 및 토글 체크 기능</li>
-          <li>완료 시각 자동 기록 및 Gemini 피드백 초안 연동</li>
+          <li>한국 표준시(KST) 완료 시각 9시간 오차 수정</li>
+          <li>주차별 캘린더 네비게이션 및 카테고리 추가 기능</li>
+          <li>완료 항목 취소선/흐림 효과 제거 및 타임라인 탭 신설</li>
         </ul>
+      </div>
+    </div>
+
+    <!-- [인증 모달] 로그인 / 회원가입 팝업 -->
+    <div id="auth-modal" class="fixed inset-0 bg-black/85 flex items-center justify-center p-4 z-50 hidden">
+      <div class="bg-[#161b26] border border-slate-700 p-6 rounded-2xl w-full max-w-xs shadow-2xl">
+        <h3 class="text-base font-bold text-center text-teal-300 mb-4" id="auth-title">로그인</h3>
+        <input type="text" id="auth-id" placeholder="아이디" class="w-full bg-[#11141d] border border-slate-700 rounded-lg p-2.5 text-xs text-white mb-2 focus:outline-none focus:border-teal-400">
+        <input type="password" id="auth-pw" placeholder="비밀번호" class="w-full bg-[#11141d] border border-slate-700 rounded-lg p-2.5 text-xs text-white mb-4 focus:outline-none focus:border-teal-400">
+        <button onclick="submitAuth()" class="w-full bg-teal-400 hover:bg-teal-300 text-black font-bold py-2 rounded-lg text-xs mb-2 transition" id="auth-submit-btn">로그인</button>
+        <p class="text-center text-[11px] text-slate-400">
+          <span id="auth-switch-text">계정이 없으신가요?</span>
+          <button onclick="toggleAuthMode()" class="text-teal-400 underline ml-1" id="auth-switch-btn">회원가입</button>
+        </p>
       </div>
     </div>
 
   </div>
 
   <script>
-    let currentDate = new Date(); // 로컬 브라우저 기준 날짜
+    let currentUser = localStorage.getItem('routine_user') || '';
+    let isSignUpMode = false;
+
+    let currentDate = new Date();
     let selectedDateStr = formatDate(currentDate);
     let selectedCategory = "아침";
     let categories = [];
@@ -193,16 +230,51 @@ HTML_LAYOUT = """
       return `${year}-${month}-${day}`;
     }
 
-    // 주차 계산 함수 (월요일 시작 기준)
+    function checkAuth() {
+      if (!currentUser) {
+        document.getElementById('auth-modal').classList.remove('hidden');
+      } else {
+        document.getElementById('auth-modal').classList.add('hidden');
+        document.getElementById('user-display').innerText = `👤 ${currentUser}`;
+        loadCategories();
+        loadPlans();
+      }
+    }
+
+    function toggleAuthMode() {
+      isSignUpMode = !isSignUpMode;
+      document.getElementById('auth-title').innerText = isSignUpMode ? '회원가입' : '로그인';
+      document.getElementById('auth-submit-btn').innerText = isSignUpMode ? '가입하기' : '로그인';
+      document.getElementById('auth-switch-text').innerText = isSignUpMode ? '이미 계정이 있나요?' : '계정이 없으신가요?';
+      document.getElementById('auth-switch-btn').innerText = isSignUpMode ? '로그인' : '회원가입';
+    }
+
+    async function submitAuth() {
+      const u = document.getElementById('auth-id').value.trim();
+      const p = document.getElementById('auth-pw').value.trim();
+      if (!u || !p) return alert('아이디와 비밀번호를 입력해주세요.');
+
+      const endpoint = isSignUpMode ? '/api/signup' : '/api/login';
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: u, password: p })
+      });
+      const data = await res.json();
+      if (data.error) return alert(data.error);
+
+      currentUser = u;
+      localStorage.setItem('routine_user', u);
+      checkAuth();
+    }
+
+    function logout() {
+      localStorage.removeItem('routine_user');
+      location.reload();
+    }
+
     function getWeekInfo(date) {
-      const d = new Date(date);
-      const dayNum = d.getDay() || 7;
-      d.setDate(d.getDate() + 4 - dayNum);
-      const yearStart = new Date(d.getFullYear(), 0, 1);
-      const weekNo = Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
-      
       const month = date.getMonth() + 1;
-      // 월별 주차 계산 (간이)
       const firstDayOfMonth = new Date(date.getFullYear(), date.getMonth(), 1);
       const monthWeek = Math.ceil((date.getDate() + firstDayOfMonth.getDay()) / 7);
       return `${date.getFullYear()}년 ${month}월 ${monthWeek}주차`;
@@ -227,7 +299,7 @@ HTML_LAYOUT = """
       const container = document.getElementById('week-days-container');
       container.innerHTML = '';
 
-      const dayOfWeek = currentDate.getDay(); // 0(일) ~ 6(토)
+      const dayOfWeek = currentDate.getDay();
       const mondayOffset = (dayOfWeek === 0 ? -6 : 1) - dayOfWeek;
       const monday = new Date(currentDate);
       monday.setDate(currentDate.getDate() + mondayOffset);
@@ -265,7 +337,8 @@ HTML_LAYOUT = """
     }
 
     async function loadCategories() {
-      const res = await fetch('/api/categories');
+      if (!currentUser) return;
+      const res = await fetch(`/api/categories?username=${currentUser}`);
       categories = await res.json();
       renderCategoryBar();
     }
@@ -298,7 +371,7 @@ HTML_LAYOUT = """
         await fetch('/api/categories', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({ name: newCat.trim() })
+          body: JSON.stringify({ username: currentUser, name: newCat.trim() })
         });
         selectedCategory = newCat.trim();
         loadCategories();
@@ -306,7 +379,8 @@ HTML_LAYOUT = """
     }
 
     async function loadPlans() {
-      const res = await fetch(`/api/plans?date=${selectedDateStr}`);
+      if (!currentUser) return;
+      const res = await fetch(`/api/plans?date=${selectedDateStr}&username=${currentUser}`);
       const plans = await res.json();
       const list = document.getElementById('plan-list');
       list.innerHTML = '';
@@ -322,8 +396,6 @@ HTML_LAYOUT = """
         itemEl.onclick = () => togglePlan(item.id);
 
         const checkClass = item.is_done ? "bg-teal-400 text-black border-teal-400" : "border-slate-600 text-transparent";
-        // 취소선(line-through) 및 흐린 회색(text-slate-500) 제거 -> 선명한 텍스트 유지
-        const textClass = "text-slate-100 font-semibold";
 
         itemEl.innerHTML = `
           <div class="flex items-center space-x-3">
@@ -332,7 +404,7 @@ HTML_LAYOUT = """
             </div>
             <div>
               <span class="text-[10px] text-teal-400/80 font-medium block">[${item.category}]</span>
-              <span class="text-sm ${textClass}">${item.title}</span>
+              <span class="text-sm text-slate-100 font-semibold">${item.title}</span>
             </div>
           </div>
           ${item.is_done && item.completed_at ? `<span class="text-xs font-mono text-teal-300 bg-teal-950/80 border border-teal-700/50 px-2 py-0.5 rounded-md font-bold">${item.completed_at} 완료</span>` : ''}
@@ -347,7 +419,7 @@ HTML_LAYOUT = """
       await fetch('/api/plans', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({ category: selectedCategory, title: input.value, plan_date: selectedDateStr })
+        body: JSON.stringify({ username: currentUser, category: selectedCategory, title: input.value, plan_date: selectedDateStr })
       });
       input.value = '';
       loadPlans();
@@ -363,14 +435,15 @@ HTML_LAYOUT = """
     }
 
     async function loadTimeline() {
+      if (!currentUser) return;
       document.getElementById('timeline-date-label').innerText = selectedDateStr;
-      const res = await fetch(`/api/timeline?date=${selectedDateStr}`);
+      const res = await fetch(`/api/timeline?date=${selectedDateStr}&username=${currentUser}`);
       const data = await res.json();
       const list = document.getElementById('timeline-list');
       list.innerHTML = '';
 
       if (data.length === 0) {
-        list.innerHTML = `<div class="text-center py-10 text-xs text-slate-500">아직 완료된 실행 항목이 없습니다.<br>계획을 실행하고 체크해 보세요!</div>`;
+        list.innerHTML = `<div class="text-center py-10 text-xs text-slate-500">완료된 계획이 없습니다.<br>계획을 실행하고 체크해 보세요!</div>`;
         return;
       }
 
@@ -392,6 +465,7 @@ HTML_LAYOUT = """
     }
 
     async function requestAIFeedback() {
+      if (!currentUser) return;
       const card = document.getElementById('ai-card');
       const text = document.getElementById('ai-text');
       card.classList.remove('hidden');
@@ -400,16 +474,14 @@ HTML_LAYOUT = """
       const res = await fetch('/api/ai/analyze', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({ plan_date: selectedDateStr })
+        body: JSON.stringify({ username: currentUser, plan_date: selectedDateStr })
       });
       const data = await res.json();
       text.innerText = data.feedback;
     }
 
-    // 초기화 실행
     renderWeekCalendar();
-    loadCategories();
-    loadPlans();
+    checkAuth();
   </script>
 </body>
 </html>
@@ -419,11 +491,41 @@ HTML_LAYOUT = """
 def home():
     return HTMLResponse(content=HTML_LAYOUT)
 
-@app.get("/api/categories")
-def get_categories():
+# ----------------- 인증 API -----------------
+@app.post("/api/signup")
+def signup(data: UserAuth):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute("SELECT name FROM categories ORDER BY id ASC")
+    try:
+        cur.execute("INSERT INTO users (username, password) VALUES (?, ?)", (data.username, hash_pw(data.password)))
+        # 기본 카테고리 지급
+        defaults = ["아침", "업무/학습", "운동", "개인", "저녁"]
+        for c in defaults:
+            cur.execute("INSERT INTO categories (username, name) VALUES (?, ?)", (data.username, c))
+        conn.commit()
+        return {"status": "success", "username": data.username}
+    except sqlite3.IntegrityError:
+        return {"error": "이미 존재하는 아이디입니다."}
+    finally:
+        conn.close()
+
+@app.post("/api/login")
+def login(data: UserAuth):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT password FROM users WHERE username = ?", (data.username,))
+    row = cur.fetchone()
+    conn.close()
+    if row and row[0] == hash_pw(data.password):
+        return {"status": "success", "username": data.username}
+    return {"error": "아이디 또는 비밀번호가 일치하지 않습니다."}
+
+# ----------------- 카테고리 API -----------------
+@app.get("/api/categories")
+def get_categories(username: str):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM categories WHERE username = ? ORDER BY id ASC", (username,))
     rows = cur.fetchall()
     conn.close()
     return [r[0] for r in rows]
@@ -432,16 +534,20 @@ def get_categories():
 def add_category(cat: CategoryCreate):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute("INSERT OR IGNORE INTO categories (name) VALUES (?)", (cat.name,))
+    cur.execute("INSERT OR IGNORE INTO categories (username, name) VALUES (?, ?)", (cat.username, cat.name))
     conn.commit()
     conn.close()
     return {"status": "success"}
 
+# ----------------- 계획 및 타임라인 API -----------------
 @app.get("/api/plans")
-def get_plans(date: str):
+def get_plans(date: str, username: str):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute("SELECT id, category, title, is_done, completed_at FROM plans WHERE plan_date = ? ORDER BY id ASC", (date,))
+    cur.execute(
+        "SELECT id, category, title, is_done, completed_at FROM plans WHERE plan_date = ? AND username = ? ORDER BY id ASC",
+        (date, username)
+    )
     rows = cur.fetchall()
     conn.close()
     return [
@@ -454,8 +560,8 @@ def add_plan(plan: PlanCreate):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
-        "INSERT INTO plans (category, title, is_done, completed_at, plan_date) VALUES (?, ?, 0, NULL, ?)",
-        (plan.category, plan.title, plan.plan_date)
+        "INSERT INTO plans (username, category, title, is_done, completed_at, plan_date) VALUES (?, ?, ?, 0, NULL, ?)",
+        (plan.username, plan.category, plan.title, plan.plan_date)
     )
     conn.commit()
     conn.close()
@@ -472,7 +578,7 @@ def toggle_plan(payload: PlanToggle):
         return {"error": "Not found"}
 
     now_done = 0 if row[0] == 1 else 1
-    # 한국 표준시(KST)로 정확한 시:분 기록
+    # 한국 표준시(KST) 시간 기록
     completed_at = get_now_kst().strftime("%H:%M") if now_done == 1 else None
 
     cur.execute("UPDATE plans SET is_done = ?, completed_at = ? WHERE id = ?", (now_done, completed_at, payload.id))
@@ -481,12 +587,12 @@ def toggle_plan(payload: PlanToggle):
     return {"is_done": bool(now_done), "completed_at": completed_at}
 
 @app.get("/api/timeline")
-def get_timeline(date: str):
+def get_timeline(date: str, username: str):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
-        "SELECT id, category, title, completed_at FROM plans WHERE plan_date = ? AND is_done = 1 ORDER BY completed_at ASC",
-        (date,)
+        "SELECT id, category, title, completed_at FROM plans WHERE plan_date = ? AND username = ? AND is_done = 1 ORDER BY completed_at ASC",
+        (date, username)
     )
     rows = cur.fetchall()
     conn.close()
@@ -495,16 +601,20 @@ def get_timeline(date: str):
         for r in rows
     ]
 
+# ----------------- Gemini AI 분석 API -----------------
 @app.post("/api/ai/analyze")
 def analyze_plans(req: AIRequest):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute("SELECT category, title, is_done, completed_at FROM plans WHERE plan_date = ?", (req.plan_date,))
+    cur.execute(
+        "SELECT category, title, is_done, completed_at FROM plans WHERE plan_date = ? AND username = ?",
+        (req.plan_date, req.username)
+    )
     items = cur.fetchall()
     conn.close()
 
     if not items:
-        return {"feedback": f"{req.plan_date} 날짜에 등록된 계획 데이터가 없습니다. 먼저 할 일을 등록해 보세요!"}
+        return {"feedback": f"{req.plan_date} 날짜에 등록된 계획이 없습니다. 먼저 할 일을 등록해 보세요!"}
 
     records = [
         f"[{r[0]}] {r[1]} -> {'완료 (한국시각 ' + r[3] + ')' if r[2] else '미완료'}"
@@ -513,7 +623,7 @@ def analyze_plans(req: AIRequest):
     record_text = "\n".join(records)
 
     prompt = f"""
-    당신은 스마트 계획 & 실행 코치입니다. 사용자의 {req.plan_date} 계획 및 실제 실행 기록입니다:
+    당신은 스마트 계획 & 실행 코치입니다. 사용자({req.username})의 {req.plan_date} 계획 및 실제 실행 기록입니다:
     {record_text}
 
     다음 사항을 포함하여 4문장 내외로 격려와 실천 중심의 스마트 피드백을 제공해 주세요:
@@ -523,7 +633,7 @@ def analyze_plans(req: AIRequest):
     """
 
     if not ai_client:
-        return {"feedback": "GEMINI_API_KEY가 등록되지 않았습니다."}
+        return {"feedback": "GEMINI_API_KEY 환경변수가 Render에 설정되지 않았습니다."}
 
     try:
         response = ai_client.models.generate_content(
