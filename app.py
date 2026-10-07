@@ -82,19 +82,22 @@ class AIRequest(BaseModel):
     username: str
     plan_date: str
 
-# 프론트엔드 반응형 통합 UI (투두메이트 다크 테마 + 모바일 최적화)
+# 프론트엔드 반응형 통합 UI (PWA 메타태그 적용)
 HTML_LAYOUT = """
 <!DOCTYPE html>
 <html lang="ko">
 <head>
-  <link rel="manifest" href="/manifest.json">
-<meta name="mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="theme-color" content="#121620">
-<meta charset="UTF-8">
+  <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <title>스마트 계획 & 실행 트래커</title>
+  
+  <!-- 모바일 어플형 주소창 숨김 설정 (PWA) -->
+  <link rel="manifest" href="/manifest.json">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="theme-color" content="#121620">
+
   <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-[#0b0f17] text-white flex justify-center min-h-screen font-sans">
@@ -140,7 +143,7 @@ HTML_LAYOUT = """
         <div class="grid grid-cols-7 gap-1 text-center" id="week-days-container"></div>
       </div>
 
-      <!-- AI 코칭 피드백 카드 -->
+      <!-- AI 피드백 카드 -->
       <div id="ai-card" class="mx-3 mt-3 p-3.5 rounded-xl bg-gradient-to-r from-indigo-950/60 to-slate-900 border border-indigo-500/30 hidden">
         <div class="flex items-center space-x-2 text-indigo-400 font-bold text-xs mb-1.5">
           <span>🤖</span> <span>Gemini 계획 & 실행 피드백</span>
@@ -181,24 +184,23 @@ HTML_LAYOUT = """
 
       <div class="bg-[#171c28] p-3 rounded-xl border border-slate-800">
         <div class="flex items-center justify-between mb-1.5">
-          <span class="text-xs font-bold text-teal-300 bg-teal-950 px-2 py-0.5 rounded border border-teal-800">v1.2.0</span>
+          <span class="text-xs font-bold text-teal-300 bg-teal-950 px-2 py-0.5 rounded border border-teal-800">v1.3.0</span>
           <span class="text-[11px] text-slate-500">2026-10-07</span>
         </div>
         <ul class="text-xs text-slate-300 space-y-1 list-disc list-inside">
-          <li><strong>ID/PW 계정 동기화 탑재</strong>: 다중 기기(PC, 모바일) 실시간 데이터 동기화 지원</li>
-          <li><strong>비밀번호 암호화 저장</strong>: SHA-256 해시 처리 적용</li>
+          <li><strong>PWA 모바일 앱 모드 추가</strong>: 홈 화면 추가 시 브라우저 주소창 숨김 및 전체화면 구동</li>
+          <li><strong>manifest.json 연동 완료</strong>: 앱 아이콘 및 테마 색상 설정</li>
         </ul>
       </div>
 
       <div class="bg-[#171c28] p-3 rounded-xl border border-slate-800">
         <div class="flex items-center justify-between mb-1.5">
-          <span class="text-xs font-bold text-slate-300 bg-slate-800 px-2 py-0.5 rounded">v1.1.0</span>
+          <span class="text-xs font-bold text-slate-300 bg-slate-800 px-2 py-0.5 rounded">v1.2.0</span>
           <span class="text-[11px] text-slate-500">2026-10-07</span>
         </div>
         <ul class="text-xs text-slate-400 space-y-1 list-disc list-inside">
-          <li>한국 표준시(KST) 완료 시각 9시간 오차 수정</li>
-          <li>주차별 캘린더 네비게이션 및 카테고리 추가 기능</li>
-          <li>완료 항목 취소선/흐림 효과 제거 및 타임라인 탭 신설</li>
+          <li>ID/PW 계정 로그인 및 다중 기기 실시간 데이터 동기화</li>
+          <li>한국 표준시(KST) 완료 시각 및 주간 캘린더 네비게이션</li>
         </ul>
       </div>
     </div>
@@ -492,12 +494,12 @@ HTML_LAYOUT = """
 </html>
 """
 
-
+# 메인 페이지 라우트
 @app.get("/", response_class=HTMLResponse)
 def home():
     return HTMLResponse(content=HTML_LAYOUT)
 
-# ▼ 바로 여기에 붙여넣으시면 됩니다 ▼
+# PWA 웹 앱 매니페스트 (모바일 주소창 숨김)
 @app.get("/manifest.json")
 def get_manifest():
     return {
@@ -518,15 +520,11 @@ def get_manifest():
 
 # ----------------- 인증 API -----------------
 @app.post("/api/signup")
-...
-# ----------------- 인증 API -----------------
-@app.post("/api/signup")
 def signup(data: UserAuth):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     try:
         cur.execute("INSERT INTO users (username, password) VALUES (?, ?)", (data.username, hash_pw(data.password)))
-        # 기본 카테고리 지급
         defaults = ["아침", "업무/학습", "운동", "개인", "저녁"]
         for c in defaults:
             cur.execute("INSERT INTO categories (username, name) VALUES (?, ?)", (data.username, c))
@@ -606,7 +604,6 @@ def toggle_plan(payload: PlanToggle):
         return {"error": "Not found"}
 
     now_done = 0 if row[0] == 1 else 1
-    # 한국 표준시(KST) 시간 기록
     completed_at = get_now_kst().strftime("%H:%M") if now_done == 1 else None
 
     cur.execute("UPDATE plans SET is_done = ?, completed_at = ? WHERE id = ?", (now_done, completed_at, payload.id))
