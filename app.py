@@ -2,8 +2,9 @@ import os
 import sqlite3
 import hashlib
 from datetime import datetime, timezone, timedelta
+from typing import List, Optional
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 from google import genai
 
@@ -15,7 +16,6 @@ KST = timezone(timedelta(hours=9))
 def get_now_kst():
     return datetime.now(KST)
 
-# Gemini API 클라이언트 설정 (Render 환경변수 GEMINI_API_KEY)
 GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
 ai_client = genai.Client(api_key=GEMINI_KEY) if GEMINI_KEY else None
 
@@ -32,24 +32,37 @@ def init_db():
             password TEXT
         )
     """)
-    # 2. 계획 및 실행 기록 테이블
+    # 2. 계획 및 실행 기록 테이블 (알람 및 순서 컬럼)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS plans (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT,
-            category TEXT,
             title TEXT,
             is_done INTEGER DEFAULT 0,
             completed_at TEXT,
-            plan_date TEXT
+            plan_date TEXT,
+            display_order INTEGER DEFAULT 0,
+            alarm_time TEXT,
+            snooze_count INTEGER DEFAULT 0
         )
     """)
-    # 3. 카테고리 테이블
+    # 컬럼 누락 방지 마이그레이션
+    for col_def in [
+        ("display_order", "INTEGER DEFAULT 0"),
+        ("alarm_time", "TEXT"),
+        ("snooze_count", "INTEGER DEFAULT 0")
+    ]:
+        try:
+            cur.execute(f"ALTER TABLE plans ADD COLUMN {col_def[0]} {col_def[1]}")
+        except sqlite3.OperationalError:
+            pass
+
+    # 3. 자주 쓰는 항목 테이블
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS categories (
+        CREATE TABLE IF NOT EXISTS presets (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT,
-            name TEXT
+            title TEXT
         )
     """)
     conn.commit()
@@ -67,31 +80,43 @@ class UserAuth(BaseModel):
 
 class PlanCreate(BaseModel):
     username: str
-    category: str
     title: str
     plan_date: str
+    alarm_time: Optional[str] = None  # 예: "14:30" 또는 "2026-10-11 14:30"
 
 class PlanToggle(BaseModel):
     id: int
 
-class CategoryCreate(BaseModel):
+class PlanSnooze(BaseModel):
+    id: int
     username: str
-    name: str
+    minutes: int
+
+class PlanReorder(BaseModel):
+    username: str
+    ordered_ids: List[int]
+
+class PlanCopyRequest(BaseModel):
+    username: str
+    from_date: str
+    to_date: str
+
+class PresetCreate(BaseModel):
+    username: str
+    title: str
 
 class AIRequest(BaseModel):
     username: str
     plan_date: str
 
-# 프론트엔드 반응형 통합 UI (PWA 메타태그 적용)
 HTML_LAYOUT = """
 <!DOCTYPE html>
 <html lang="ko">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <title>스마트 계획 & 실행 트래커</title>
+  <title>스마트 계획 & 알람 트래커</title>
   
-  <!-- 모바일 어플형 주소창 숨김 설정 (PWA) -->
   <link rel="manifest" href="/manifest.json">
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-capable" content="yes">
@@ -99,122 +124,189 @@ HTML_LAYOUT = """
   <meta name="theme-color" content="#121620">
 
   <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.2/Sortable.min.js"></script>
+
+  <style>
+    body.theme-dark {
+      --bg-body: #0b0f17;
+      --bg-card: #121620;
+      --bg-header: #161b26;
+      --bg-item: #171c28;
+      --bg-hover: #1e2433;
+      --border: #1e2330;
+      --text-main: #f1f5f9;
+      --text-sub: #94a3b8;
+      --primary: #2dd4bf;
+      --primary-text: #000000;
+      --chip-bg: #1c2436;
+      --chip-border: #28354f;
+    }
+    body.theme-pomeranian {
+      --bg-body: #f5ede2;
+      --bg-card: #fdfbf7;
+      --bg-header: #faeee0;
+      --bg-item: #ffffff;
+      --bg-hover: #fcf4eb;
+      --border: #ebdcc9;
+      --text-main: #43302b;
+      --text-sub: #8c7365;
+      --primary: #d97706;
+      --primary-text: #ffffff;
+      --chip-bg: #f5e8d7;
+      --chip-border: #e3cdb4;
+    }
+    body { background-color: var(--bg-body); color: var(--text-main); }
+    .custom-card { background-color: var(--bg-card); border-color: var(--border); }
+    .custom-header { background-color: var(--bg-header); border-color: var(--border); }
+    .custom-item { background-color: var(--bg-item); border-color: var(--border); }
+    .custom-border { border-color: var(--border); }
+    .text-sub { color: var(--text-sub); }
+  </style>
 </head>
-<body class="bg-[#0b0f17] text-white flex justify-center min-h-screen font-sans">
-  <div class="w-full max-w-md bg-[#121620] border-x border-[#1e2330] flex flex-col min-h-screen shadow-2xl relative">
+<body class="theme-dark flex justify-center min-h-screen font-sans">
+  <div class="custom-card w-full max-w-md border-x flex flex-col min-h-screen shadow-2xl relative">
     
     <!-- 상단 헤더 -->
-    <header class="p-4 border-b border-[#1e2330] flex justify-between items-center bg-[#161b26]">
+    <header class="custom-header p-4 border-b flex justify-between items-center">
       <div>
-        <h1 class="text-base font-bold tracking-tight text-teal-400">⚡ 스마트 계획 & 실행</h1>
-        <p class="text-xs text-slate-400" id="header-week-title">2026년 10월 2주차</p>
+        <div class="flex items-center space-x-1.5">
+          <span id="theme-logo-icon">⚡</span>
+          <h1 class="text-base font-bold tracking-tight">스마트 계획 & 알람</h1>
+        </div>
+        <p class="text-xs text-sub mt-0.5" id="header-week-title"></p>
       </div>
       <div class="flex items-center space-x-2">
-        <span id="user-display" class="text-xs font-semibold text-teal-300"></span>
-        <button onclick="logout()" class="text-[11px] text-slate-400 hover:text-rose-400 transition">로그아웃</button>
-        <button onclick="requestAIFeedback()" class="bg-indigo-600 hover:bg-indigo-500 text-xs px-2.5 py-1.5 rounded-full font-semibold transition shadow-md">
-          ✨ AI
-        </button>
+        <button onclick="toggleTheme()" id="theme-toggle-btn" class="text-xs px-2 py-1 rounded-full font-bold border custom-border bg-black/10">🐾 포메테마</button>
+        <span id="user-display" class="text-xs font-semibold"></span>
+        <button onclick="logout()" class="text-[11px] text-sub hover:text-rose-400">로그아웃</button>
+        <button onclick="requestAIFeedback()" class="bg-indigo-600 hover:bg-indigo-500 text-white text-xs px-2.5 py-1.5 rounded-full font-semibold shadow-md">✨ AI</button>
       </div>
     </header>
 
-    <!-- 상단 네비게이션 탭 -->
-    <nav class="flex border-b border-[#1e2330] bg-[#141924] text-xs font-semibold">
-      <button id="tab-plan-btn" onclick="switchTab('plan')" class="flex-1 py-3 text-center border-b-2 border-teal-400 text-teal-300">
-        📋 계획 & 실행
-      </button>
-      <button id="tab-timeline-btn" onclick="switchTab('timeline')" class="flex-1 py-3 text-center border-b-2 border-transparent text-slate-400 hover:text-slate-200">
-        ⏱️ 타임라인
-      </button>
-      <button id="tab-patch-btn" onclick="switchTab('patch')" class="flex-1 py-3 text-center border-b-2 border-transparent text-slate-400 hover:text-slate-200">
-        📝 패치노트
-      </button>
+    <!-- 탭 네비게이션 -->
+    <nav class="custom-header flex border-b text-xs font-semibold">
+      <button id="tab-plan-btn" onclick="switchTab('plan')" class="flex-1 py-3 text-center border-b-2 font-bold" style="border-color: var(--primary); color: var(--primary);">📋 계획 & 실행</button>
+      <button id="tab-timeline-btn" onclick="switchTab('timeline')" class="flex-1 py-3 text-center border-b-2 border-transparent text-sub">⏱️ 타임라인</button>
+      <button id="tab-widget-btn" onclick="switchTab('widget')" class="flex-1 py-3 text-center border-b-2 border-transparent text-sub">📱 홈위젯 가이드</button>
     </nav>
 
     <!-- [탭 1] 계획 & 실행 뷰 -->
     <div id="tab-plan" class="flex-1 flex flex-col">
-      <!-- 주간 캘린더 네비게이터 -->
-      <div class="p-3 bg-[#161b26] border-b border-[#1e2330]">
+      <!-- 캘린더 네비게이터 -->
+      <div class="custom-header p-3 border-b">
         <div class="flex justify-between items-center mb-2 px-1">
-          <button onclick="changeWeek(-1)" class="text-slate-400 hover:text-white px-2 py-0.5 rounded bg-slate-800 text-xs">◀ 이전 주</button>
-          <span id="calendar-title" class="text-xs font-bold text-slate-300"></span>
-          <button onclick="changeWeek(1)" class="text-slate-400 hover:text-white px-2 py-0.5 rounded bg-slate-800 text-xs">다음 주 ▶</button>
+          <button onclick="changeWeek(-1)" class="text-sub px-2 py-0.5 rounded text-xs bg-black/10">◀ 이전 주</button>
+          <span id="calendar-title" class="text-xs font-bold"></span>
+          <button onclick="changeWeek(1)" class="text-sub px-2 py-0.5 rounded text-xs bg-black/10">다음 주 ▶</button>
         </div>
         <div class="grid grid-cols-7 gap-1 text-center" id="week-days-container"></div>
       </div>
 
-      <!-- AI 피드백 카드 -->
-      <div id="ai-card" class="mx-3 mt-3 p-3.5 rounded-xl bg-gradient-to-r from-indigo-950/60 to-slate-900 border border-indigo-500/30 hidden">
-        <div class="flex items-center space-x-2 text-indigo-400 font-bold text-xs mb-1.5">
-          <span>🤖</span> <span>Gemini 계획 & 실행 피드백</span>
+      <!-- 복사 툴바 -->
+      <div class="custom-header flex items-center justify-between px-3 py-2 border-b text-[11px]">
+        <span class="text-sub font-medium">📋 빠른 계획 복사</span>
+        <div class="flex space-x-1.5">
+          <button onclick="copyFromYesterday()" class="custom-item px-2 py-1 rounded-lg border text-xs">⬅️ 어제 계획 가져오기</button>
+          <button onclick="copyToTomorrow()" class="px-2 py-1 rounded-lg border text-xs font-bold" style="background-color: var(--primary); color: var(--primary-text); border-color: var(--primary);">내일로 복사 ➡️</button>
         </div>
-        <p id="ai-text" class="text-xs leading-relaxed text-slate-300 whitespace-pre-line"></p>
       </div>
 
-      <!-- 카테고리 태그 및 입력 영역 -->
-      <div class="p-3">
-        <div class="flex items-center space-x-1.5 overflow-x-auto pb-2 scrollbar-none" id="category-bar"></div>
+      <!-- AI 분석 피드백 카드 -->
+      <div id="ai-card" class="mx-3 mt-2.5 p-3.5 rounded-xl border border-indigo-500/30 bg-indigo-950/20 hidden">
+        <div class="flex items-center space-x-2 text-indigo-400 font-bold text-xs mb-1.5">
+          <span>🤖</span> <span>Gemini 실행 분석</span>
+        </div>
+        <p id="ai-text" class="text-xs leading-relaxed text-sub whitespace-pre-line"></p>
+      </div>
 
-        <form onsubmit="addPlan(event)" class="flex gap-2 mt-2">
-          <input type="text" id="plan-input" placeholder="실행할 계획 입력..." required
-            class="flex-1 bg-[#1a202e] border border-[#2d354a] rounded-xl px-3.5 py-2.5 text-sm focus:outline-none focus:border-teal-400 text-white placeholder-slate-500">
-          <button type="submit" class="bg-teal-400 hover:bg-teal-300 text-black font-bold px-4 rounded-xl text-base transition">+</button>
+      <!-- 자주 쓰는 항목 -->
+      <div class="px-3 pt-3 pb-1">
+        <div class="flex items-center justify-between mb-1.5">
+          <span class="text-[11px] font-bold" style="color: var(--primary);">⭐ 자주 쓰는 항목</span>
+          <button onclick="promptAddPreset()" class="text-[10px] text-sub underline">+ 항목 추가</button>
+        </div>
+        <div class="flex items-center space-x-1.5 overflow-x-auto pb-2 scrollbar-none" id="preset-bar"></div>
+      </div>
+
+      <!-- 입력 폼: 계획명 + 알람 시간 설정 -->
+      <div class="px-3 pb-2">
+        <form onsubmit="addPlan(event)" class="flex flex-col gap-2 mt-1">
+          <div class="flex gap-2">
+            <input type="text" id="plan-input" placeholder="실행할 계획 입력..." required
+              autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
+              class="custom-item custom-border flex-1 border rounded-xl px-3.5 py-2.5 text-sm focus:outline-none placeholder:text-slate-500">
+            <button type="submit" class="font-bold px-4 rounded-xl text-base shadow-sm" style="background-color: var(--primary); color: var(--primary-text);">+</button>
+          </div>
+          <div class="flex items-center space-x-2 text-xs text-sub pl-1">
+            <span>⏰ 알람 시간 (선택):</span>
+            <input type="time" id="plan-alarm-time" class="custom-item custom-border border rounded-lg px-2 py-1 text-xs focus:outline-none">
+            <span class="text-[10px] opacity-70">도래 시 사운드/미루기 알람 팝업</span>
+          </div>
         </form>
       </div>
 
-      <!-- 계획 리스트 목록 -->
+      <!-- 계획 목록 (드래그앤드롭 지원) -->
       <div class="flex-1 px-3 pb-4 space-y-2 overflow-y-auto" id="plan-list"></div>
     </div>
 
     <!-- [탭 2] 타임라인 뷰 -->
     <div id="tab-timeline" class="flex-1 flex flex-col p-4 hidden">
       <div class="flex justify-between items-center mb-4">
-        <h2 class="text-sm font-bold text-teal-300">⏱️ 오늘 실행 타임라인</h2>
-        <span class="text-xs text-slate-400 font-mono" id="timeline-date-label"></span>
+        <h2 class="text-sm font-bold" style="color: var(--primary);">⏱️ 오늘 실행 타임라인</h2>
+        <span class="text-xs text-sub font-mono" id="timeline-date-label"></span>
       </div>
       <div class="flex-1 overflow-y-auto space-y-2.5" id="timeline-list"></div>
     </div>
 
-    <!-- [탭 3] 패치노트 뷰 -->
-    <div id="tab-patch" class="flex-1 flex flex-col p-4 overflow-y-auto hidden space-y-3">
-      <div class="border-b border-slate-800 pb-2">
-        <h2 class="text-sm font-bold text-teal-400">🚀 패치노트</h2>
-        <p class="text-xs text-slate-400">시스템 업데이트 히스토리</p>
+    <!-- [탭 3] 스마트폰 홈 위젯 가이드 -->
+    <div id="tab-widget" class="flex-1 flex flex-col p-4 overflow-y-auto hidden space-y-3">
+      <div class="border-b custom-border pb-2">
+        <h2 class="text-sm font-bold" style="color: var(--primary);">📱 휴대폰 바탕화면 위젯 연동 안내</h2>
+        <p class="text-xs text-sub mt-0.5">웹페이지를 켜지 않고 바탕화면에서 바로 체크하기</p>
       </div>
-
-      <div class="bg-[#171c28] p-3 rounded-xl border border-slate-800">
-        <div class="flex items-center justify-between mb-1.5">
-          <span class="text-xs font-bold text-teal-300 bg-teal-950 px-2 py-0.5 rounded border border-teal-800">v1.3.0</span>
-          <span class="text-[11px] text-slate-500">2026-10-07</span>
-        </div>
-        <ul class="text-xs text-slate-300 space-y-1 list-disc list-inside">
-          <li><strong>PWA 모바일 앱 모드 추가</strong>: 홈 화면 추가 시 브라우저 주소창 숨김 및 전체화면 구동</li>
-          <li><strong>manifest.json 연동 완료</strong>: 앱 아이콘 및 테마 색상 설정</li>
-        </ul>
-      </div>
-
-      <div class="bg-[#171c28] p-3 rounded-xl border border-slate-800">
-        <div class="flex items-center justify-between mb-1.5">
-          <span class="text-xs font-bold text-slate-300 bg-slate-800 px-2 py-0.5 rounded">v1.2.0</span>
-          <span class="text-[11px] text-slate-500">2026-10-07</span>
-        </div>
-        <ul class="text-xs text-slate-400 space-y-1 list-disc list-inside">
-          <li>ID/PW 계정 로그인 및 다중 기기 실시간 데이터 동기화</li>
-          <li>한국 표준시(KST) 완료 시각 및 주간 캘린더 네비게이션</li>
-        </ul>
+      <div class="custom-item p-3.5 rounded-xl border space-y-2 text-xs leading-relaxed">
+        <p class="font-bold text-teal-400">💡 3분 만에 위젯 만드는 법 (HTTP Shortcuts 앱)</p>
+        <p>1. 구글 플레이스토어에서 무료 앱 <strong>HTTP Shortcuts</strong>를 설치합니다.</p>
+        <p>2. 새 단축키를 만들고 아래 전용 위젯 주소를 입력합니다:</p>
+        <div class="p-2 bg-black/30 rounded font-mono text-[11px] text-teal-300 break-all" id="widget-api-url"></div>
+        <p>3. 휴대폰 바탕화면을 길게 누르고 <strong>위젯 추가 ➔ HTTP Shortcuts</strong>를 선택하면, 앱을 열지 않고도 남은 할 일과 원클릭 체크가 바탕화면에 바로 나타납니다.</p>
       </div>
     </div>
 
-    <!-- [인증 모달] 로그인 / 회원가입 팝업 -->
+    <!-- [알람 울림 팝업 모달: 완료 or 미루기] -->
+    <div id="alarm-ring-modal" class="fixed inset-0 bg-black/85 flex items-center justify-center p-4 z-50 hidden">
+      <div class="custom-card border p-6 rounded-2xl w-full max-w-xs shadow-2xl text-center">
+        <div class="text-3xl mb-2 animate-bounce">⏰</div>
+        <h3 class="text-base font-bold mb-1" style="color: var(--primary);" id="alarm-ring-title">계획 알람</h3>
+        <p class="text-xs text-sub mb-4" id="alarm-ring-time"></p>
+        
+        <div class="space-y-2">
+          <!-- 완료 처리 -->
+          <button onclick="handleAlarmComplete()" class="w-full py-2.5 rounded-xl font-bold text-xs shadow-md transition" style="background-color: var(--primary); color: var(--primary-text);">
+            ✔ 지금 완료했습니다!
+          </button>
+          
+          <div class="border-t custom-border pt-2 text-[11px] text-sub">미루기 시간 선택</div>
+          <div class="grid grid-cols-3 gap-1.5">
+            <button onclick="handleAlarmSnooze(5)" class="custom-item border py-1.5 rounded-lg text-xs hover:border-teal-400">5분</button>
+            <button onclick="handleAlarmSnooze(10)" class="custom-item border py-1.5 rounded-lg text-xs hover:border-teal-400">10분</button>
+            <button onclick="handleAlarmSnooze(30)" class="custom-item border py-1.5 rounded-lg text-xs hover:border-teal-400">30분</button>
+          </div>
+          <button onclick="handleAlarmSnoozeCustom()" class="w-full custom-item border py-1.5 rounded-lg text-xs text-sub">직접 분 입력 미루기</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 로그인 모달 -->
     <div id="auth-modal" class="fixed inset-0 bg-black/85 flex items-center justify-center p-4 z-50 hidden">
-      <div class="bg-[#161b26] border border-slate-700 p-6 rounded-2xl w-full max-w-xs shadow-2xl">
-        <h3 class="text-base font-bold text-center text-teal-300 mb-4" id="auth-title">로그인</h3>
-        <input type="text" id="auth-id" placeholder="아이디" class="w-full bg-[#11141d] border border-slate-700 rounded-lg p-2.5 text-xs text-white mb-2 focus:outline-none focus:border-teal-400">
-        <input type="password" id="auth-pw" placeholder="비밀번호" class="w-full bg-[#11141d] border border-slate-700 rounded-lg p-2.5 text-xs text-white mb-4 focus:outline-none focus:border-teal-400">
-        <button onclick="submitAuth()" class="w-full bg-teal-400 hover:bg-teal-300 text-black font-bold py-2 rounded-lg text-xs mb-2 transition" id="auth-submit-btn">로그인</button>
-        <p class="text-center text-[11px] text-slate-400">
+      <div class="custom-card border p-6 rounded-2xl w-full max-w-xs shadow-2xl">
+        <h3 class="text-base font-bold text-center mb-4" id="auth-title" style="color: var(--primary);">로그인</h3>
+        <input type="text" id="auth-id" placeholder="아이디" autocomplete="off" class="custom-item custom-border w-full border rounded-lg p-2.5 text-xs mb-2 focus:outline-none">
+        <input type="password" id="auth-pw" placeholder="비밀번호" class="custom-item custom-border w-full border rounded-lg p-2.5 text-xs mb-4 focus:outline-none">
+        <button onclick="submitAuth()" class="w-full font-bold py-2 rounded-lg text-xs mb-2" style="background-color: var(--primary); color: var(--primary-text);" id="auth-submit-btn">로그인</button>
+        <p class="text-center text-[11px] text-sub">
           <span id="auth-switch-text">계정이 없으신가요?</span>
-          <button onclick="toggleAuthMode()" class="text-teal-400 underline ml-1" id="auth-switch-btn">회원가입</button>
+          <button onclick="toggleAuthMode()" class="underline ml-1 font-bold" id="auth-switch-btn" style="color: var(--primary);">회원가입</button>
         </p>
       </div>
     </div>
@@ -223,12 +315,53 @@ HTML_LAYOUT = """
 
   <script>
     let currentUser = localStorage.getItem('routine_user') || '';
+    let currentTheme = localStorage.getItem('routine_theme') || 'theme-dark';
     let isSignUpMode = false;
 
     let currentDate = new Date();
     let selectedDateStr = formatDate(currentDate);
-    let selectedCategory = "아침";
-    let categories = [];
+    let presets = [];
+    let sortableInstance = null;
+    let currentRingingPlan = null;
+    let triggeredAlarms = new Set();
+
+    // 웹 오디오 신시사이저로 청량한 알람 비프음 재생
+    function playAlarmSound() {
+      try {
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(880, ctx.currentTime);
+        osc.frequency.setValueAtTime(1200, ctx.currentTime + 0.15);
+        gain.gain.setValueAtTime(0.3, ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.6);
+        osc.start();
+        osc.stop(ctx.currentTime + 0.6);
+      } catch(e) {}
+    }
+
+    function applyTheme(theme) {
+      document.body.className = `${theme} flex justify-center min-h-screen font-sans`;
+      const btn = document.getElementById('theme-toggle-btn');
+      const logo = document.getElementById('theme-logo-icon');
+      if (theme === 'theme-pomeranian') {
+        btn.innerText = "🌙 다크모드";
+        logo.innerText = "🐾";
+      } else {
+        btn.innerText = "🐾 포메테마";
+        logo.innerText = "⚡";
+      }
+      localStorage.setItem('routine_theme', theme);
+    }
+
+    function toggleTheme() {
+      currentTheme = currentTheme === 'theme-dark' ? 'theme-pomeranian' : 'theme-dark';
+      applyTheme(currentTheme);
+      renderWeekCalendar();
+    }
 
     function formatDate(d) {
       const year = d.getFullYear();
@@ -243,7 +376,11 @@ HTML_LAYOUT = """
       } else {
         document.getElementById('auth-modal').classList.add('hidden');
         document.getElementById('user-display').innerText = `👤 ${currentUser}`;
-        loadCategories();
+        document.getElementById('widget-api-url').innerText = window.location.origin + `/api/widget/summary?username=${currentUser}`;
+        if (Notification.permission !== "granted") {
+          Notification.requestPermission();
+        }
+        loadPresets();
         loadPlans();
       }
     }
@@ -261,8 +398,8 @@ HTML_LAYOUT = """
       const p = document.getElementById('auth-pw').value.trim();
       if (!u || !p) return alert('아이디와 비밀번호를 입력해주세요.');
 
-      const endpoint = isSignUpMode ? '/api/signup' : '/api/login';
-      const res = await fetch(endpoint, {
+      const ep = isSignUpMode ? '/api/signup' : '/api/login';
+      const res = await fetch(ep, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ username: u, password: p })
@@ -288,12 +425,16 @@ HTML_LAYOUT = """
     }
 
     function switchTab(tab) {
-      ['plan', 'timeline', 'patch'].forEach(t => {
+      ['plan', 'timeline', 'widget'].forEach(t => {
         document.getElementById(`tab-${t}`).classList.add('hidden');
-        document.getElementById(`tab-${t}-btn`).className = "flex-1 py-3 text-center border-b-2 border-transparent text-slate-400 hover:text-slate-200";
+        const btn = document.getElementById(`tab-${t}-btn`);
+        btn.style.borderColor = 'transparent';
+        btn.style.color = 'var(--text-sub)';
       });
       document.getElementById(`tab-${tab}`).classList.remove('hidden');
-      document.getElementById(`tab-${tab}-btn`).className = "flex-1 py-3 text-center border-b-2 border-teal-400 text-teal-300";
+      const activeBtn = document.getElementById(`tab-${tab}-btn`);
+      activeBtn.style.borderColor = 'var(--primary)';
+      activeBtn.style.color = 'var(--primary)';
 
       if (tab === 'timeline') loadTimeline();
     }
@@ -320,7 +461,12 @@ HTML_LAYOUT = """
         const isSelected = targetStr === selectedDateStr;
 
         const col = document.createElement('div');
-        col.className = `flex flex-col items-center py-1.5 rounded-xl cursor-pointer transition ${isSelected ? 'bg-teal-400 text-black font-bold' : 'hover:bg-slate-800 text-slate-300'}`;
+        col.className = `flex flex-col items-center py-1.5 rounded-xl cursor-pointer transition ${isSelected ? 'font-bold shadow-sm' : 'hover:opacity-80 text-sub'}`;
+        if (isSelected) {
+          col.style.backgroundColor = 'var(--primary)';
+          col.style.color = 'var(--primary-text)';
+        }
+
         col.onclick = () => {
           selectedDateStr = targetStr;
           currentDate = new Date(target);
@@ -329,7 +475,7 @@ HTML_LAYOUT = """
         };
 
         col.innerHTML = `
-          <span class="text-[10px] ${isSelected ? 'text-black' : (i >= 5 ? 'text-rose-400' : 'text-slate-400')}">${dayNames[i]}</span>
+          <span class="text-[10px] ${isSelected ? '' : (i >= 5 ? 'text-rose-400' : 'text-sub')}">${dayNames[i]}</span>
           <span class="text-sm mt-0.5">${target.getDate()}</span>
         `;
         container.appendChild(col);
@@ -343,48 +489,56 @@ HTML_LAYOUT = """
       loadPlans();
     }
 
-    async function loadCategories() {
+    // --- 자주 쓰는 항목(프리셋) ---
+    async function loadPresets() {
       if (!currentUser) return;
-      const res = await fetch(`/api/categories?username=${currentUser}`);
-      categories = await res.json();
-      renderCategoryBar();
-    }
-
-    function renderCategoryBar() {
-      const bar = document.getElementById('category-bar');
+      const res = await fetch(`/api/presets?username=${currentUser}`);
+      presets = await res.json();
+      const bar = document.getElementById('preset-bar');
       bar.innerHTML = '';
 
-      categories.forEach(cat => {
-        const isSel = cat === selectedCategory;
-        const btn = document.createElement('button');
-        btn.type = 'button';
-        btn.onclick = () => { selectedCategory = cat; renderCategoryBar(); };
-        btn.className = `px-3 py-1 rounded-full text-xs font-semibold whitespace-nowrap transition ${isSel ? 'bg-teal-400 text-black' : 'bg-[#202738] text-slate-300 hover:bg-[#283247]'}`;
-        btn.innerText = cat;
-        bar.appendChild(btn);
+      presets.forEach(p => {
+        const chip = document.createElement('div');
+        chip.className = "flex items-center space-x-1 border text-xs px-2.5 py-1 rounded-full whitespace-nowrap cursor-pointer";
+        chip.style.backgroundColor = "var(--chip-bg)";
+        chip.style.borderColor = "var(--chip-border)";
+        chip.innerHTML = `
+          <span onclick="applyPreset('${p.title}')">+ ${p.title}</span>
+          <span onclick="deletePreset(${p.id}, event)" class="text-sub hover:text-rose-400 text-xs ml-1">×</span>
+        `;
+        bar.appendChild(chip);
       });
-
-      const addBtn = document.createElement('button');
-      addBtn.type = 'button';
-      addBtn.onclick = promptAddCategory;
-      addBtn.className = "px-2.5 py-1 rounded-full text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-teal-300 border border-slate-700 whitespace-nowrap";
-      addBtn.innerText = "+ 카테고리";
-      bar.appendChild(addBtn);
     }
 
-    async function promptAddCategory() {
-      const newCat = prompt("새로 추가할 카테고리 이름을 입력하세요:");
-      if (newCat && newCat.trim()) {
-        await fetch('/api/categories', {
+    async function applyPreset(title) {
+      await fetch('/api/plans', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ username: currentUser, title: title, plan_date: selectedDateStr })
+      });
+      loadPlans();
+    }
+
+    async function promptAddPreset() {
+      const title = prompt("자주 사용할 계획 이름을 입력하세요:");
+      if (title && title.trim()) {
+        await fetch('/api/presets', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({ username: currentUser, name: newCat.trim() })
+          body: JSON.stringify({ username: currentUser, title: title.trim() })
         });
-        selectedCategory = newCat.trim();
-        loadCategories();
+        loadPresets();
       }
     }
 
+    async function deletePreset(id, e) {
+      e.stopPropagation();
+      if (!confirm("이 항목을 삭제하시겠습니까?")) return;
+      await fetch(`/api/presets/${id}?username=${currentUser}`, { method: 'DELETE' });
+      loadPresets();
+    }
+
+    // --- 계획 목록 & 알람 감시 ---
     async function loadPlans() {
       if (!currentUser) return;
       const res = await fetch(`/api/plans?date=${selectedDateStr}&username=${currentUser}`);
@@ -393,42 +547,66 @@ HTML_LAYOUT = """
       list.innerHTML = '';
 
       if (plans.length === 0) {
-        list.innerHTML = `<div class="text-center py-10 text-xs text-slate-500">등록된 계획이 없습니다. 아래에서 계획을 추가해보세요!</div>`;
+        list.innerHTML = `<div class="text-center py-10 text-xs text-sub">등록된 계획이 없습니다.</div>`;
         return;
       }
 
       plans.forEach(item => {
         const itemEl = document.createElement('div');
-        itemEl.className = "flex items-center justify-between p-3.5 bg-[#171c28] hover:bg-[#1d2333] rounded-xl transition cursor-pointer select-none border border-slate-800/50";
-        itemEl.onclick = () => togglePlan(item.id);
+        itemEl.dataset.id = item.id;
+        itemEl.className = "custom-item custom-border flex items-center justify-between p-3 rounded-xl border select-none shadow-sm";
 
-        const checkClass = item.is_done ? "bg-teal-400 text-black border-teal-400" : "border-slate-600 text-transparent";
+        const checkBg = item.is_done ? 'background-color: var(--primary); border-color: var(--primary); color: var(--primary-text);' : 'border-color: var(--border); color: transparent;';
 
         itemEl.innerHTML = `
-          <div class="flex items-center space-x-3">
-            <div class="w-6 h-6 rounded-lg border-2 flex items-center justify-center font-bold text-xs transition ${checkClass}">
-              ✔
-            </div>
+          <div class="flex items-center space-x-3 flex-1 cursor-pointer" onclick="togglePlan(${item.id})">
+            <div class="w-6 h-6 rounded-lg border-2 flex items-center justify-center font-bold text-xs" style="${checkBg}">✔</div>
             <div>
-              <span class="text-[10px] text-teal-400/80 font-medium block">[${item.category}]</span>
-              <span class="text-sm text-slate-100 font-semibold">${item.title}</span>
+              <span class="text-sm font-semibold">${item.title}</span>
+              ${item.alarm_time && !item.is_done ? `<span class="block text-[10px] text-amber-400 mt-0.5">⏰ ${item.alarm_time} 알람 (${item.snooze_count ? item.snooze_count + '회 미룸' : '예정'})</span>` : ''}
             </div>
           </div>
-          ${item.is_done && item.completed_at ? `<span class="text-xs font-mono text-teal-300 bg-teal-950/80 border border-teal-700/50 px-2 py-0.5 rounded-md font-bold">${item.completed_at} 완료</span>` : ''}
+          <div class="flex items-center space-x-2">
+            ${item.is_done && item.completed_at ? `<span class="text-xs font-mono font-bold px-2 py-0.5 rounded-md border" style="color: var(--primary); border-color: var(--primary);">${item.completed_at} 완료</span>` : ''}
+            <span class="drag-handle cursor-grab p-1 text-sub text-base">⋮⋮</span>
+          </div>
         `;
         list.appendChild(itemEl);
       });
+
+      if (sortableInstance) sortableInstance.destroy();
+      sortableInstance = new Sortable(list, {
+        handle: '.drag-handle',
+        animation: 150,
+        onEnd: async function () {
+          const orderedIds = Array.from(list.children).map(el => parseInt(el.dataset.id)).filter(id => !isNaN(id));
+          await fetch('/api/plans/reorder', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ username: currentUser, ordered_ids: orderedIds })
+          });
+        }
+      });
+
+      checkAlarms(plans);
     }
 
     async function addPlan(e) {
       e.preventDefault();
       const input = document.getElementById('plan-input');
+      const alarmInput = document.getElementById('plan-alarm-time');
       await fetch('/api/plans', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({ username: currentUser, category: selectedCategory, title: input.value, plan_date: selectedDateStr })
+        body: JSON.stringify({
+          username: currentUser,
+          title: input.value,
+          plan_date: selectedDateStr,
+          alarm_time: alarmInput.value || null
+        })
       });
       input.value = '';
+      alarmInput.value = '';
       loadPlans();
     }
 
@@ -441,6 +619,102 @@ HTML_LAYOUT = """
       loadPlans();
     }
 
+    // --- 실시간 알람 트리거 및 미루기 처리 ---
+    function checkAlarms(plans) {
+      const now = new Date();
+      const curTimeStr = String(now.getHours()).padStart(2, '0') + ':' + String(now.getMinutes()).padStart(2, '0');
+      const todayStr = formatDate(now);
+
+      if (selectedDateStr !== todayStr) return;
+
+      plans.forEach(p => {
+        if (!p.is_done && p.alarm_time && p.alarm_time === curTimeStr) {
+          const alarmKey = `${p.id}-${p.alarm_time}`;
+          if (!triggeredAlarms.has(alarmKey)) {
+            triggeredAlarms.add(alarmKey);
+            triggerAlarmModal(p);
+          }
+        }
+      });
+    }
+
+    // 10초마다 알람 감시
+    setInterval(() => {
+      if (currentUser) loadPlans();
+    }, 10000);
+
+    function triggerAlarmModal(plan) {
+      currentRingingPlan = plan;
+      playAlarmSound();
+
+      if (Notification.permission === "granted") {
+        new Notification("⏰ 계획 알람!", {
+          body: `[${plan.title}] 실행할 시간입니다!`,
+          icon: "https://cdn-icons-png.flaticon.com/512/906/906334.png"
+        });
+      }
+
+      document.getElementById('alarm-ring-title').innerText = plan.title;
+      document.getElementById('alarm-ring-time').innerText = `설정 시각: ${plan.alarm_time} (지금 실행하세요!)`;
+      document.getElementById('alarm-ring-modal').classList.remove('hidden');
+    }
+
+    async function handleAlarmComplete() {
+      if (!currentRingingPlan) return;
+      await togglePlan(currentRingingPlan.id);
+      document.getElementById('alarm-ring-modal').classList.add('hidden');
+      currentRingingPlan = null;
+    }
+
+    async function handleAlarmSnooze(minutes) {
+      if (!currentRingingPlan) return;
+      await fetch('/api/plans/snooze', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ id: currentRingingPlan.id, username: currentUser, minutes: minutes })
+      });
+      document.getElementById('alarm-ring-modal').classList.add('hidden');
+      currentRingingPlan = null;
+      loadPlans();
+    }
+
+    function handleAlarmSnoozeCustom() {
+      const min = prompt("몇 분 뒤로 미루시겠습니까? (숫자만 입력):", "15");
+      if (min && !isNaN(min)) {
+        handleAlarmSnooze(parseInt(min));
+      }
+    }
+
+    // --- 복사 & 타임라인 & AI ---
+    async function copyToTomorrow() {
+      const cur = new Date(selectedDateStr);
+      cur.setDate(cur.getDate() + 1);
+      const tomorrowStr = formatDate(cur);
+      if (!confirm(`[${selectedDateStr}] 계획들을 내일로 복사하시겠습니까?`)) return;
+      const res = await fetch('/api/plans/copy', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ username: currentUser, from_date: selectedDateStr, to_date: tomorrowStr })
+      });
+      const data = await res.json();
+      alert(data.message);
+    }
+
+    async function copyFromYesterday() {
+      const cur = new Date(selectedDateStr);
+      cur.setDate(cur.getDate() - 1);
+      const yesterdayStr = formatDate(cur);
+      if (!confirm(`어제 계획들을 가져오시겠습니까?`)) return;
+      const res = await fetch('/api/plans/copy', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ username: currentUser, from_date: yesterdayStr, to_date: selectedDateStr })
+      });
+      const data = await res.json();
+      alert(data.message);
+      loadPlans();
+    }
+
     async function loadTimeline() {
       if (!currentUser) return;
       document.getElementById('timeline-date-label').innerText = selectedDateStr;
@@ -448,24 +722,17 @@ HTML_LAYOUT = """
       const data = await res.json();
       const list = document.getElementById('timeline-list');
       list.innerHTML = '';
-
       if (data.length === 0) {
-        list.innerHTML = `<div class="text-center py-10 text-xs text-slate-500">완료된 계획이 없습니다.<br>계획을 실행하고 체크해 보세요!</div>`;
+        list.innerHTML = `<div class="text-center py-10 text-xs text-sub">완료된 계획이 없습니다.</div>`;
         return;
       }
-
       data.forEach(item => {
         const el = document.createElement('div');
-        el.className = "flex items-center space-x-3 p-3 bg-[#171c28] rounded-xl border border-teal-900/40";
+        el.className = "custom-item custom-border flex items-center space-x-3 p-3 rounded-xl border";
         el.innerHTML = `
-          <span class="text-xs font-mono font-bold text-teal-300 bg-teal-950 px-2 py-1 rounded border border-teal-700/40">
-            ${item.completed_at}
-          </span>
-          <div class="flex-1">
-            <span class="text-[10px] text-slate-400 block">${item.category}</span>
-            <span class="text-sm font-semibold text-slate-100">${item.title}</span>
-          </div>
-          <span class="text-xs text-teal-400 font-bold">✔ 완료</span>
+          <span class="text-xs font-mono font-bold px-2 py-1 rounded border" style="color: var(--primary); border-color: var(--primary);">${item.completed_at}</span>
+          <div class="flex-1"><span class="text-sm font-semibold">${item.title}</span></div>
+          <span class="text-xs font-bold" style="color: var(--primary);">✔ 완료</span>
         `;
         list.appendChild(el);
       });
@@ -476,8 +743,7 @@ HTML_LAYOUT = """
       const card = document.getElementById('ai-card');
       const text = document.getElementById('ai-text');
       card.classList.remove('hidden');
-      text.innerText = "Gemini가 한국시간 기준 계획 및 실행 기록을 분석 중입니다...";
-
+      text.innerText = "Gemini가 분석 중입니다...";
       const res = await fetch('/api/ai/analyze', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
@@ -487,6 +753,7 @@ HTML_LAYOUT = """
       text.innerText = data.feedback;
     }
 
+    applyTheme(currentTheme);
     renderWeekCalendar();
     checkAuth();
   </script>
@@ -494,28 +761,20 @@ HTML_LAYOUT = """
 </html>
 """
 
-# 메인 페이지 라우트
 @app.get("/", response_class=HTMLResponse)
 def home():
     return HTMLResponse(content=HTML_LAYOUT)
 
-# PWA 웹 앱 매니페스트 (모바일 주소창 숨김)
 @app.get("/manifest.json")
 def get_manifest():
     return {
-        "name": "스마트 루틴 & 계획 트래커",
+        "name": "스마트 계획 & 알람 트래커",
         "short_name": "루틴트래커",
         "start_url": "/",
         "display": "standalone",
         "background_color": "#121620",
         "theme_color": "#121620",
-        "icons": [
-            {
-                "src": "https://cdn-icons-png.flaticon.com/512/906/906334.png",
-                "sizes": "512x512",
-                "type": "image/png"
-            }
-        ]
+        "icons": [{"src": "https://cdn-icons-png.flaticon.com/512/906/906334.png", "sizes": "512x512", "type": "image/png"}]
     }
 
 # ----------------- 인증 API -----------------
@@ -525,9 +784,9 @@ def signup(data: UserAuth):
     cur = conn.cursor()
     try:
         cur.execute("INSERT INTO users (username, password) VALUES (?, ?)", (data.username, hash_pw(data.password)))
-        defaults = ["아침", "업무/학습", "운동", "개인", "저녁"]
-        for c in defaults:
-            cur.execute("INSERT INTO categories (username, name) VALUES (?, ?)", (data.username, c))
+        default_presets = ["0650 기상", "콩산책", "푸쉬업, 아령", "몸무게 측정", "하루 계획 점검"]
+        for title in default_presets:
+            cur.execute("INSERT INTO presets (username, title) VALUES (?, ?)", (data.username, title))
         conn.commit()
         return {"status": "success", "username": data.username}
     except sqlite3.IntegrityError:
@@ -546,38 +805,47 @@ def login(data: UserAuth):
         return {"status": "success", "username": data.username}
     return {"error": "아이디 또는 비밀번호가 일치하지 않습니다."}
 
-# ----------------- 카테고리 API -----------------
-@app.get("/api/categories")
-def get_categories(username: str):
+# ----------------- 자주 쓰는 항목 API -----------------
+@app.get("/api/presets")
+def get_presets(username: str):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute("SELECT name FROM categories WHERE username = ? ORDER BY id ASC", (username,))
+    cur.execute("SELECT id, title FROM presets WHERE username = ? ORDER BY id ASC", (username,))
     rows = cur.fetchall()
     conn.close()
-    return [r[0] for r in rows]
+    return [{"id": r[0], "title": r[1]} for r in rows]
 
-@app.post("/api/categories")
-def add_category(cat: CategoryCreate):
+@app.post("/api/presets")
+def add_preset(preset: PresetCreate):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute("INSERT OR IGNORE INTO categories (username, name) VALUES (?, ?)", (cat.username, cat.name))
+    cur.execute("INSERT INTO presets (username, title) VALUES (?, ?)", (preset.username, preset.title))
     conn.commit()
     conn.close()
     return {"status": "success"}
 
-# ----------------- 계획 및 타임라인 API -----------------
+@app.delete("/api/presets/{preset_id}")
+def delete_preset(preset_id: int, username: str):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM presets WHERE id = ? AND username = ?", (preset_id, username))
+    conn.commit()
+    conn.close()
+    return {"status": "success"}
+
+# ----------------- 계획 CRUD & 미루기 API -----------------
 @app.get("/api/plans")
 def get_plans(date: str, username: str):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
-        "SELECT id, category, title, is_done, completed_at FROM plans WHERE plan_date = ? AND username = ? ORDER BY id ASC",
+        "SELECT id, title, is_done, completed_at, alarm_time, snooze_count FROM plans WHERE plan_date = ? AND username = ? ORDER BY display_order ASC, id ASC",
         (date, username)
     )
     rows = cur.fetchall()
     conn.close()
     return [
-        {"id": r[0], "category": r[1], "title": r[2], "is_done": bool(r[3]), "completed_at": r[4]}
+        {"id": r[0], "title": r[1], "is_done": bool(r[2]), "completed_at": r[3], "alarm_time": r[4], "snooze_count": r[5]}
         for r in rows
     ]
 
@@ -585,13 +853,65 @@ def get_plans(date: str, username: str):
 def add_plan(plan: PlanCreate):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
+    cur.execute("SELECT COALESCE(MAX(display_order), 0) + 1 FROM plans WHERE plan_date = ? AND username = ?", (plan.plan_date, plan.username))
+    next_order = cur.fetchone()[0]
+
     cur.execute(
-        "INSERT INTO plans (username, category, title, is_done, completed_at, plan_date) VALUES (?, ?, ?, 0, NULL, ?)",
-        (plan.username, plan.category, plan.title, plan.plan_date)
+        "INSERT INTO plans (username, title, is_done, completed_at, plan_date, display_order, alarm_time, snooze_count) VALUES (?, ?, 0, NULL, ?, ?, ?, 0)",
+        (plan.username, plan.title, plan.plan_date, next_order, plan.alarm_time)
     )
     conn.commit()
     conn.close()
     return {"status": "success"}
+
+@app.post("/api/plans/snooze")
+def snooze_plan(payload: PlanSnooze):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    # 현재 KST 시각 기준 n분 뒤로 계산
+    new_alarm_dt = get_now_kst() + timedelta(minutes=payload.minutes)
+    new_alarm_time = new_alarm_dt.strftime("%H:%M")
+
+    cur.execute(
+        "UPDATE plans SET alarm_time = ?, snooze_count = snooze_count + 1 WHERE id = ? AND username = ?",
+        (new_alarm_time, payload.id, payload.username)
+    )
+    conn.commit()
+    conn.close()
+    return {"status": "success", "new_alarm_time": new_alarm_time}
+
+@app.post("/api/plans/reorder")
+def reorder_plans(payload: PlanReorder):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    for idx, plan_id in enumerate(payload.ordered_ids):
+        cur.execute("UPDATE plans SET display_order = ? WHERE id = ? AND username = ?", (idx, plan_id, payload.username))
+    conn.commit()
+    conn.close()
+    return {"status": "success"}
+
+@app.post("/api/plans/copy")
+def copy_plans(req: PlanCopyRequest):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT title, display_order, alarm_time FROM plans WHERE plan_date = ? AND username = ? ORDER BY display_order ASC", (req.from_date, req.username))
+    items = cur.fetchall()
+
+    if not items:
+        conn.close()
+        return {"message": f"{req.from_date}에 복사할 계획이 없습니다."}
+
+    copied_count = 0
+    for title, order, alarm in items:
+        cur.execute(
+            "INSERT INTO plans (username, title, is_done, completed_at, plan_date, display_order, alarm_time, snooze_count) VALUES (?, ?, 0, NULL, ?, ?, ?, 0)",
+            (req.username, title, req.to_date, order, alarm)
+        )
+        copied_count += 1
+
+    conn.commit()
+    conn.close()
+    return {"message": f"{copied_count}개의 계획이 복사되었습니다!"}
 
 @app.post("/api/plans/toggle")
 def toggle_plan(payload: PlanToggle):
@@ -616,15 +936,49 @@ def get_timeline(date: str, username: str):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
-        "SELECT id, category, title, completed_at FROM plans WHERE plan_date = ? AND username = ? AND is_done = 1 ORDER BY completed_at ASC",
+        "SELECT id, title, completed_at FROM plans WHERE plan_date = ? AND username = ? AND is_done = 1 ORDER BY completed_at ASC",
         (date, username)
     )
     rows = cur.fetchall()
     conn.close()
-    return [
-        {"id": r[0], "category": r[1], "title": r[2], "completed_at": r[3]}
+    return [{"id": r[0], "title": r[1], "completed_at": r[2]} for r in rows]
+
+# ----------------- 📱 홈 화면 위젯 전용 API -----------------
+@app.get("/api/widget/summary")
+def widget_summary(username: str):
+    """휴대폰 위젯에서 브라우저 없이 바로 남은 계획을 띄우고 체크하는 초경량 API"""
+    today = get_now_kst().strftime("%Y-%m-%d")
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, title, is_done, completed_at, alarm_time FROM plans WHERE plan_date = ? AND username = ? ORDER BY is_done ASC, display_order ASC",
+        (today, username)
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    total = len(rows)
+    done_count = sum(1 for r in rows if r[2] == 1)
+    remaining_count = total - done_count
+
+    items = [
+        {
+            "id": r[0],
+            "title": r[1],
+            "is_done": bool(r[2]),
+            "completed_at": r[3],
+            "alarm_time": r[4]
+        }
         for r in rows
     ]
+
+    return JSONResponse(content={
+        "date": today,
+        "total": total,
+        "done": done_count,
+        "remaining": remaining_count,
+        "items": items
+    })
 
 # ----------------- Gemini AI 분석 API -----------------
 @app.post("/api/ai/analyze")
@@ -632,33 +986,27 @@ def analyze_plans(req: AIRequest):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
-        "SELECT category, title, is_done, completed_at FROM plans WHERE plan_date = ? AND username = ?",
+        "SELECT title, is_done, completed_at FROM plans WHERE plan_date = ? AND username = ? ORDER BY display_order ASC",
         (req.plan_date, req.username)
     )
     items = cur.fetchall()
     conn.close()
 
     if not items:
-        return {"feedback": f"{req.plan_date} 날짜에 등록된 계획이 없습니다. 먼저 할 일을 등록해 보세요!"}
+        return {"feedback": f"{req.plan_date}에 등록된 계획이 없습니다."}
 
-    records = [
-        f"[{r[0]}] {r[1]} -> {'완료 (한국시각 ' + r[3] + ')' if r[2] else '미완료'}"
-        for r in items
-    ]
+    records = [f"- {r[0]} -> {'완료 (' + r[2] + ')' if r[1] else '미완료'}" for r in items]
     record_text = "\n".join(records)
 
     prompt = f"""
-    당신은 스마트 계획 & 실행 코치입니다. 사용자({req.username})의 {req.plan_date} 계획 및 실제 실행 기록입니다:
+    당신은 스마트 계획 & 실행 코치입니다. 사용자({req.username})의 {req.plan_date} 실행 기록입니다:
     {record_text}
 
-    다음 사항을 포함하여 4문장 내외로 격려와 실천 중심의 스마트 피드백을 제공해 주세요:
-    1. 오늘 계획의 달성률과 시간대별 실행 집중도 평가
-    2. 미완료 항목 또는 딜레이된 시간에 대한 분석
-    3. 내일 더 높은 실행력을 내기 위한 스마트 팁 1가지
+    4문장 내외로 오늘 실행률을 칭찬하고 개선점 1가지를 명확히 짚어주세요.
     """
 
     if not ai_client:
-        return {"feedback": "GEMINI_API_KEY 환경변수가 Render에 설정되지 않았습니다."}
+        return {"feedback": "GEMINI_API_KEY가 설정되지 않았습니다."}
 
     try:
         response = ai_client.models.generate_content(
